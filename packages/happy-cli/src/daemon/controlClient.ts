@@ -4,7 +4,7 @@
  */
 
 import { logger } from '@/ui/logger';
-import { clearDaemonState, readDaemonState } from '@/persistence';
+import { clearDaemonState, readDaemonState, readDaemonLockPid } from '@/persistence';
 import { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 
@@ -227,32 +227,62 @@ export async function cleanupDaemonState(): Promise<void> {
 export async function stopDaemon() {
   try {
     const state = await readDaemonState();
-    if (!state) {
-      logger.debug('No daemon state found');
+
+    if (state) {
+      logger.debug(`Stopping daemon with PID ${state.pid}`);
+
+      // Try HTTP graceful stop first (lets the daemon flush state cleanly).
+      try {
+        await stopDaemonHttp();
+        await waitForProcessDeath(state.pid, 2000);
+        logger.debug('Daemon stopped gracefully via HTTP');
+        return;
+      } catch (error) {
+        logger.debug('HTTP stop failed, will force kill', error);
+      }
+
+      // Force kill the PID we know about.
+      try {
+        process.kill(state.pid, 'SIGKILL');
+        logger.debug('Force killed daemon');
+      } catch (error) {
+        logger.debug('Daemon already dead');
+      }
       return;
     }
 
-    logger.debug(`Stopping daemon with PID ${state.pid}`);
-
-    // Try HTTP graceful stop
-    try {
-      await stopDaemonHttp();
-
-      // Wait for daemon to die
-      await waitForProcessDeath(state.pid, 2000);
-      logger.debug('Daemon stopped gracefully via HTTP');
-      return;
-    } catch (error) {
-      logger.debug('HTTP stop failed, will force kill', error);
+    // Orphan-recovery path: no state file, but the lock file may still point
+    // at a live daemon process. This happens when a previous `happy daemon
+    // stop` deleted the state file but failed to kill the underlying process,
+    // or when the daemon crashed before writing state. Without this fallback
+    // the next `happy daemon start` would refuse to start because it sees an
+    // alive PID holding the lock (#unknown — observed locally 2026-05-19).
+    const orphanPid = readDaemonLockPid();
+    if (orphanPid && orphanPid !== process.pid) {
+      try {
+        process.kill(orphanPid, 0); // probe: throws if process gone
+        logger.debug(
+          `No daemon state file, but lock file points at running PID ${orphanPid}; force-killing orphan`,
+        );
+        try {
+          process.kill(orphanPid, 'SIGKILL');
+          await waitForProcessDeath(orphanPid, 2000).catch(() => undefined);
+        } catch (killErr) {
+          logger.debug('Failed to kill orphan daemon (may already be dead)', killErr);
+        }
+        // Best-effort cleanup so the next acquireDaemonLock() succeeds.
+        await cleanupDaemonState();
+        return;
+      } catch {
+        // Probe failed → orphan PID isn't alive after all; lock file is stale.
+        // acquireDaemonLock() reclaims stale locks on its own, so just clean up.
+        logger.debug(`Lock file PID ${orphanPid} not running; treating lock as stale`);
+        await cleanupDaemonState();
+        return;
+      }
     }
 
-    // Force kill
-    try {
-      process.kill(state.pid, 'SIGKILL');
-      logger.debug('Force killed daemon');
-    } catch (error) {
-      logger.debug('Daemon already dead');
-    }
+    logger.debug('No daemon state found');
   } catch (error) {
     logger.debug('Error stopping daemon', error);
   }

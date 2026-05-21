@@ -50,6 +50,11 @@ Step 3: Start using `happy` instead of `claude` or `codex`
 happy claude
 # or
 happy codex
+# or, for Atlassian Rovo Dev users (wraps `acli rovodev acp` over the ACP protocol):
+happy rovodev
+
+# If your `acli` version has a broken `acp` subcommand, point at a working binary directly:
+# HAPPY_ROVODEV_COMMAND=/path/to/atlassian_cli_rovodev happy rovodev
 ```
 
 ## How does it work?

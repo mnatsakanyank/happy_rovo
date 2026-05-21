@@ -34,6 +34,7 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
 import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
+import { handleRovodevCommand } from './commands/rovodevCommand'
 
 
 (async () => {
@@ -140,6 +141,20 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     try {
       await handleCodexCommand(args.slice(1));
       // Do not force exit here; allow instrumentation to show lingering handles
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      if (process.env.DEBUG) {
+        console.error(error)
+      }
+      process.exit(1)
+    }
+    return;
+  } else if (subcommand === 'rovodev') {
+    // Handle `happy rovodev` — wraps `acli rovodev acp` via the generic ACP runner.
+    // Rovo Dev users are already authenticated via `acli`; Happy still pairs
+    // with the mobile app via the standard QR flow.
+    try {
+      await handleRovodevCommand(args);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {

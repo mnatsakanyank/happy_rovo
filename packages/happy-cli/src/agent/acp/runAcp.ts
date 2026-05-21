@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import * as readline from 'node:readline';
 import { ApiClient } from '@/api/api';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { AgentMessage } from '@/agent/core';
 import { AcpBackend, type AcpPermissionHandler } from './AcpBackend';
 import { DefaultTransport } from '@/agent/transport';
 import { AcpSessionManager } from './AcpSessionManager';
-import type { SessionEnvelope } from '@slopus/happy-wire';
+import { createEnvelope, type SessionEnvelope } from '@slopus/happy-wire';
 import { logger } from '@/ui/logger';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
@@ -406,6 +407,7 @@ function resolveRequestedLegacyModelCode(models: SessionModelState, requested: s
 
 class GenericAcpPermissionHandler extends BasePermissionHandler implements AcpPermissionHandler {
   private readonly logPrefix: string;
+  private localResponder: ((toolCallId: string, toolName: string, input: unknown) => void) | null = null;
 
   constructor(session: ApiSessionClient, agentName: string) {
     super(session);
@@ -414,6 +416,49 @@ class GenericAcpPermissionHandler extends BasePermissionHandler implements AcpPe
 
   protected getLogPrefix(): string {
     return this.logPrefix;
+  }
+
+  setLocalResponder(responder: ((toolCallId: string, toolName: string, input: unknown) => void) | null) {
+    this.localResponder = responder;
+  }
+
+  /**
+   * Resolve a pending permission request from a local (terminal) user.
+   * Mirrors the server-side flow in BasePermissionHandler.handleRpcPermissionResponse.
+   */
+  resolveLocally(toolCallId: string, decision: 'approved' | 'approved_for_session' | 'denied'): boolean {
+    const pending = this.pendingRequests.get(toolCallId);
+    if (!pending) {
+      return false;
+    }
+    this.pendingRequests.delete(toolCallId);
+    pending.resolve({ decision });
+    // Move request to completed in agent state so the mobile UI updates.
+    // This mirrors the logic in BasePermissionHandler.handleRpcPermissionResponse
+    // so terminal answers behave identically to mobile answers.
+    try {
+      this.session.updateAgentState((currentState: any) => {
+        const request = currentState.requests?.[toolCallId];
+        if (!request) return currentState;
+        const { [toolCallId]: _removed, ...remainingRequests } = currentState.requests || {};
+        return {
+          ...currentState,
+          requests: remainingRequests,
+          completedRequests: {
+            ...currentState.completedRequests,
+            [toolCallId]: {
+              ...request,
+              completedAt: Date.now(),
+              status: decision === 'denied' ? 'denied' : 'approved',
+              decision,
+            },
+          },
+        };
+      });
+    } catch (error) {
+      logger.debug(`${this.logPrefix} Failed to update agent state for local permission resolve:`, error);
+    }
+    return true;
   }
 
   async handleToolCall(toolCallId: string, toolName: string, input: unknown): Promise<PermissionResult> {
@@ -426,6 +471,11 @@ class GenericAcpPermissionHandler extends BasePermissionHandler implements AcpPe
       });
       this.addPendingRequestToState(toolCallId, toolName, input);
       logger.debug(`${this.logPrefix} Permission request sent for tool: ${toolName} (${toolCallId})`);
+      try {
+        this.localResponder?.(toolCallId, toolName, input);
+      } catch (error) {
+        logger.debug(`${this.logPrefix} Local responder threw:`, error);
+      }
     });
   }
 }
@@ -516,10 +566,57 @@ export async function runAcp(opts: {
   // process that died while a tool prompt was open — see the matching
   // call in claudeRemoteLauncher for the full rationale.
   permissionHandler.reset('Previous CLI process exited before responding');
+
+  // When the terminal is attached, surface incoming permission requests on stdout
+  // and let the user answer them with y / n / a (alongside the mobile app button).
+  // This handler is installed below once we know whether stdin is a TTY.
+  const installLocalPermissionResponder = () => {
+    permissionHandler.setLocalResponder((toolCallId, toolName, input) => {
+      pendingTerminalPermissions.push({ id: toolCallId, toolName });
+      // Clean up the tool name: strip markdown code fences and collapse
+      // whitespace so multi-line provider titles render on a single line.
+      const cleanedName = toolName
+        .replace(/`{2,}/g, '') // strip code fences (``, ```, ````)
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160);
+      // Drop noisy permission-policy meta fields that providers like rovodev
+      // include alongside the actual tool input.
+      const META_KEYS = new Set([
+        'tool_name',
+        'toolName',
+        'pattern',
+        'permission_pattern',
+        'policy',
+      ]);
+      let cleanedArgs: Record<string, unknown> | unknown = input;
+      if (input && typeof input === 'object' && !Array.isArray(input)) {
+        const filtered: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+          if (!META_KEYS.has(k)) filtered[k] = v;
+        }
+        cleanedArgs = filtered;
+      }
+      const hasArgs = !!cleanedArgs
+        && typeof cleanedArgs === 'object'
+        && !Array.isArray(cleanedArgs)
+        && Object.keys(cleanedArgs as Record<string, unknown>).length > 0;
+      const argsLine = hasArgs ? `\n   args: ${formatUnknownForConsole(cleanedArgs, 200)}` : '';
+      // Print on a fresh line so we don't garble streaming model output.
+      if (terminalModelStreaming) {
+        process.stdout.write('\n');
+        terminalModelStreaming = false;
+      }
+      process.stdout.write(
+        `\n🔒 Permission requested: ${cleanedName}${argsLine}\n   [y]es / [n]o / [a]llow for session / answer on phone\n> `,
+      );
+    });
+  };
   const sessionManager = new AcpSessionManager();
   const messageQueue = new MessageQueue2<AcpSwitchMode>((mode) => hashObject(mode));
   let currentPermissionMode: string | undefined;
   let currentModel: string | null | undefined;
+  let terminalRl: readline.Interface | null = null;
   let modeSelector: AcpConfigSelector | null = null;
   let modelSelector: AcpConfigSelector | null = null;
   let legacyModes: SessionModeState | null = null;
@@ -552,6 +649,13 @@ export async function runAcp(opts: {
   let shouldExit = false;
   let abortController = new AbortController();
   let pendingTurn: PendingTurn | null = null;
+  // Buffers full model-output for the terminal so we render it cleanly at
+  // turn end (instead of one log line per streaming delta).
+  let terminalModelOutput = '';
+  let terminalModelStreaming = false;
+  // FIFO list of pending permission request IDs the terminal user can answer
+  // with y / n / a. Each entry represents an open prompt awaiting a decision.
+  const pendingTerminalPermissions: { id: string; toolName: string }[] = [];
 
   const clearPendingTurn = (error?: Error) => {
     if (!pendingTurn) {
@@ -803,6 +907,18 @@ export async function runAcp(opts: {
       }
     }
 
+    // If a permission was resolved remotely (phone), remove it from the
+    // terminal's pending queue so y/n/a stops targeting it.
+    if (msg.type === 'permission-response' && terminalRl) {
+      const idx = pendingTerminalPermissions.findIndex((p) => p.id === msg.id);
+      if (idx >= 0) {
+        const removed = pendingTerminalPermissions.splice(idx, 1)[0];
+        process.stdout.write(
+          `   → ${msg.approved ? 'approved' : 'denied'} (${removed.toolName}) (answered remotely)\n`,
+        );
+      }
+    }
+
     if (msg.type === 'status') {
       const suffix = msg.detail ? `: ${msg.detail}` : '';
       const statusLine = `Status: ${msg.status}${suffix}`;
@@ -813,6 +929,13 @@ export async function runAcp(opts: {
         session.keepAlive(thinking, 'remote');
       }
       if (msg.status === 'idle') {
+        // Flush any pending streamed model output as a single clean line
+        // before showing the next prompt.
+        if (terminalRl && terminalModelStreaming) {
+          process.stdout.write('\n');
+          terminalModelStreaming = false;
+          terminalModelOutput = '';
+        }
         clearPendingTurn();
       }
       if (msg.status === 'error' || msg.status === 'stopped') {
@@ -820,9 +943,37 @@ export async function runAcp(opts: {
       }
     }
 
-    const frontendMessage = formatAcpMessageForFrontend(opts.agentName, msg, verbose);
-    if (frontendMessage) {
-      logAcp(frontendMessage.kind, frontendMessage.text);
+    // When the terminal is attached, stream model output directly to stdout
+    // (one continuous line of text) instead of one log line per delta. This
+    // matches how interactive CLIs render assistant replies. The mobile app
+    // still receives the message via sessionManager.mapMessage below.
+    if (terminalRl && msg.type === 'model-output') {
+      const delta = msg.textDelta ?? '';
+      const full = msg.fullText;
+      if (full !== undefined && full.length > terminalModelOutput.length) {
+        // Non-streaming or replacement full text: print only the new suffix.
+        const suffix = full.slice(terminalModelOutput.length);
+        if (suffix) {
+          if (!terminalModelStreaming) {
+            process.stdout.write('\n');
+            terminalModelStreaming = true;
+          }
+          process.stdout.write(suffix);
+          terminalModelOutput = full;
+        }
+      } else if (delta) {
+        if (!terminalModelStreaming) {
+          process.stdout.write('\n');
+          terminalModelStreaming = true;
+        }
+        process.stdout.write(delta);
+        terminalModelOutput += delta;
+      }
+    } else {
+      const frontendMessage = formatAcpMessageForFrontend(opts.agentName, msg, verbose);
+      if (frontendMessage) {
+        logAcp(frontendMessage.kind, frontendMessage.text);
+      }
     }
 
     sendEnvelopes(sessionManager.mapMessage(msg));
@@ -850,6 +1001,72 @@ export async function runAcp(opts: {
       model: currentModel,
     });
   });
+  // Allow prompts to be entered directly from the terminal when stdin is a TTY.
+  // Messages from the terminal feed the same messageQueue as the mobile app,
+  // so both input sources work simultaneously.
+  if (process.stdin.isTTY) {
+    terminalRl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: false,
+    });
+    installLocalPermissionResponder();
+    process.stdout.write('> ');
+    terminalRl.on('line', (line) => {
+      const text = line.trim();
+      if (!text) {
+        process.stdout.write('> ');
+        return;
+      }
+
+      // If a permission prompt is open, treat single-letter answers as a decision
+      // for the oldest pending request. Anything else falls through to a chat prompt.
+      if (pendingTerminalPermissions.length > 0) {
+        const lower = text.toLowerCase();
+        let decision: 'approved' | 'approved_for_session' | 'denied' | null = null;
+        if (lower === 'y' || lower === 'yes') decision = 'approved';
+        else if (lower === 'n' || lower === 'no') decision = 'denied';
+        else if (lower === 'a' || lower === 'always') decision = 'approved_for_session';
+
+        if (decision) {
+          const next = pendingTerminalPermissions.shift()!;
+          const ok = permissionHandler.resolveLocally(next.id, decision);
+          if (ok) {
+            const label = decision === 'denied' ? 'denied' : decision === 'approved_for_session' ? 'allowed for session' : 'approved';
+            process.stdout.write(`   → ${label} (${next.toolName})\n`);
+          } else {
+            process.stdout.write(`   → permission ${next.id} already resolved (likely answered on phone)\n`);
+          }
+          if (pendingTerminalPermissions.length > 0) {
+            process.stdout.write('> ');
+          }
+          return;
+        }
+      }
+
+      // Mirror the prompt to the server so connected mobile/web clients see it.
+      try {
+        session.sendSessionProtocolMessage(
+          createEnvelope('user', { t: 'text', text }),
+        );
+      } catch (error) {
+        logger.debug(`[${opts.agentName}] Failed to mirror terminal prompt to server:`, error);
+      }
+      messageQueue.push(text, {
+        permissionMode: currentPermissionMode,
+        model: currentModel ?? undefined,
+      });
+    });
+    terminalRl.on('close', () => {
+      // stdin was closed (e.g. Ctrl-D) — shut down gracefully
+      if (!shouldExit) {
+        shouldExit = true;
+        messageQueue.close();
+        clearPendingTurn(new Error('Terminal stdin closed'));
+      }
+    });
+  }
+
   session.keepAlive(thinking, 'remote');
 
   const keepAliveInterval = setInterval(() => {
@@ -911,6 +1128,9 @@ export async function runAcp(opts: {
       }
 
       logAcp('incoming', `Incoming prompt: ${formatUnknownForConsole(batch.message, ACP_EVENT_PREVIEW_CHARS)}`);
+      // Reset terminal model-output buffer for the new turn.
+      terminalModelOutput = '';
+      terminalModelStreaming = false;
       sendEnvelopes(sessionManager.startTurn());
       const turnEnded = waitForTurnEnd();
       try {
@@ -927,6 +1147,9 @@ export async function runAcp(opts: {
         if (verbose) {
           logAcp('muted', `Outgoing prompt completion from ${opts.agentName}`);
         }
+        if (terminalRl) {
+          process.stdout.write('> ');
+        }
       } catch (error) {
         sendEnvelopes(sessionManager.endTurn('failed'));
         session.sendSessionEvent({ type: 'ready' });
@@ -938,6 +1161,13 @@ export async function runAcp(opts: {
   } finally {
     clearInterval(keepAliveInterval);
     reconnectionHandle?.cancel();
+
+    try {
+      terminalRl?.close();
+      terminalRl = null;
+    } catch {
+      // best-effort
+    }
     clearPendingTurn(new Error('ACP runner shutting down'));
 
     try {

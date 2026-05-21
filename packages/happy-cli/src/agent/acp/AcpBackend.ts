@@ -34,6 +34,14 @@ import type {
 import { logger } from '@/ui/logger';
 import { delay } from '@/utils/time';
 import packageJson from '../../../package.json';
+import { diagnoseAcpExit } from './acpStderrDiagnostics';
+
+/**
+ * How much trailing stderr we keep in memory to feed into {@link diagnoseAcpExit}
+ * when the child exits non-zero. 16 KB easily covers a Python traceback while
+ * bounding memory use over a long-running session.
+ */
+const STDERR_DIAGNOSTIC_BUFFER_BYTES = 16 * 1024;
 
 /**
  * Retry configuration for ACP operations
@@ -334,6 +342,13 @@ export class AcpBackend implements AgentBackend {
   /** Map from real tool call ID to tool name for auto-approval */
   private toolCallIdToNameMap = new Map<string, string>();
 
+  /**
+   * Accessor set up in {@link startSession} that returns the rolling tail of
+   * the agent process's stderr. Used by the exit handler to produce a friendly
+   * diagnosis via {@link diagnoseAcpExit}. `undefined` until startSession runs.
+   */
+  private getStderrTailForDiagnostics: (() => string) | undefined;
+
   /** Track if we just sent a prompt with change_title instruction */
   private recentPromptHadChangeTitle = false;
 
@@ -433,10 +448,25 @@ export class AcpBackend implements AgentBackend {
         rejectStartupFailure?.(error);
       };
 
+      // Keep a rolling tail of stderr so we can produce a friendly diagnostic
+      // if the child exits non-zero. We intentionally store text (post-decode)
+      // and trim once it exceeds the configured budget — the most recent bytes
+      // are the ones that matter for Python tracebacks.
+      let stderrTail = '';
+      const appendToStderrTail = (chunk: string) => {
+        stderrTail += chunk;
+        if (stderrTail.length > STDERR_DIAGNOSTIC_BUFFER_BYTES) {
+          stderrTail = stderrTail.slice(-STDERR_DIAGNOSTIC_BUFFER_BYTES);
+        }
+      };
+
       // Handle stderr output via transport handler
       this.process.stderr.on('data', (data: Buffer) => {
         const text = data.toString();
         if (!text.trim()) return;
+
+        // Buffer for post-mortem diagnosis (always, even for "investigation" output)
+        appendToStderrTail(text);
 
         // Build context for transport handler
         const hasActiveInvestigation = this.transport.isInvestigationTool
@@ -464,6 +494,10 @@ export class AcpBackend implements AgentBackend {
         }
       });
 
+      // Expose for the exit handler below without escaping this scope.
+      // (Arrow function preserves `this`; the closure captures stderrTail.)
+      this.getStderrTailForDiagnostics = () => stderrTail;
+
       this.process.on('error', (err) => {
         signalStartupFailure(err);
         // Log to file only, not console
@@ -474,9 +508,20 @@ export class AcpBackend implements AgentBackend {
 
       this.process.on('exit', (code, signal) => {
         if (!this.disposed && code !== 0 && code !== null) {
-          signalStartupFailure(new Error(`Exit code: ${code}`));
-          logger.debug(`[AcpBackend] Process exited with code ${code}, signal ${signal}`);
-          this.emit({ type: 'status', status: 'stopped', detail: `Exit code: ${code}` });
+          // Attempt a friendly diagnosis from the trailing stderr so users see
+          // something actionable instead of just "Exit code: 1". Falls back to
+          // the raw exit message if nothing matches a known pattern.
+          const tail = this.getStderrTailForDiagnostics?.() ?? '';
+          const diag = diagnoseAcpExit(tail, this.options.agentName);
+          const baseDetail = `Exit code: ${code}`;
+          const detail = diag ? `${baseDetail} — ${diag.hint}` : baseDetail;
+
+          signalStartupFailure(new Error(detail));
+          logger.debug(
+            `[AcpBackend] Process exited with code ${code}, signal ${signal}` +
+              (diag ? ` (diagnosis: ${diag.pattern})` : ''),
+          );
+          this.emit({ type: 'status', status: 'stopped', detail });
         }
       });
 
@@ -543,6 +588,11 @@ export class AcpBackend implements AgentBackend {
                   controller.enqueue(encoder.encode(filtered + '\n'));
                 } else {
                   // Method returned null, filter out
+                  // Surface the dropped content at debug level so users can
+                  // diagnose why their ACP child appears to "do nothing" —
+                  // e.g. when an agent prints a TUI banner or an unexpected
+                  // pre-flight prompt instead of JSON-RPC frames.
+                  logger.debug(`[AcpBackend] Filtered non-JSON stdout line from ${transport.agentName}: ${line}`);
                   filteredCount++;
                 }
               }
@@ -567,30 +617,53 @@ export class AcpBackend implements AgentBackend {
         requestPermission: async (params: RequestPermissionRequest): Promise<RequestPermissionResponse> => {
           
           const extendedParams = params as ExtendedRequestPermissionRequest;
-          const toolCall = extendedParams.toolCall;
-          let toolName = toolCall?.kind || toolCall?.toolName || extendedParams.kind || 'Unknown tool';
+          const toolCall = extendedParams.toolCall as (typeof extendedParams.toolCall & {
+            title?: string | null;
+            rawInput?: Record<string, unknown>;
+          }) | undefined;
+          // Tool name candidates, in order of preference. ACP spec uses `kind`,
+          // but providers (e.g. rovodev) often only populate `title` (a human
+          // readable name) and `rawInput`. We fall back to a cleaned `title`
+          // only as a last resort: long multi-line markdown titles can break
+          // mobile-app permission UI matching, so we collapse whitespace and
+          // strip code fences before using them as a tool-name identifier.
+          const cleanedTitle = toolCall?.title
+            ? toolCall.title.replace(/`{2,}/g, '').replace(/\s+/g, ' ').trim().slice(0, 120)
+            : undefined;
+          let toolName =
+            toolCall?.kind
+            || toolCall?.toolName
+            || extendedParams.kind
+            || cleanedTitle
+            || 'Unknown tool';
           // Use toolCallId as the single source of truth for permission ID
           // This ensures mobile app sends back the same ID that we use to store pending requests
           const toolCallId = toolCall?.id || randomUUID();
           const permissionId = toolCallId; // Use same ID for consistency!
-          
+
           // Extract input/arguments from various possible locations FIRST (before checking toolName)
           let input: Record<string, unknown> = {};
           if (toolCall) {
-            input = toolCall.input || toolCall.arguments || toolCall.content || {};
+            input =
+              toolCall.input
+              || toolCall.arguments
+              || toolCall.rawInput
+              || toolCall.content
+              || {};
           } else {
             // If no toolCall, try to extract from params directly
             input = extendedParams.input || extendedParams.arguments || extendedParams.content || {};
           }
-          
+
           // If toolName is "other" or "Unknown tool", try to determine real tool name
           const context: ToolNameContext = {
             recentPromptHadChangeTitle: this.recentPromptHadChangeTitle,
             toolCallCountSincePrompt: this.toolCallCountSincePrompt,
           };
+          const originalToolName = toolName;
           toolName = this.transport.determineToolName?.(toolName, toolCallId, input, context) ?? toolName;
-          
-          if (toolName !== (toolCall?.kind || toolCall?.toolName || extendedParams.kind || 'Unknown tool')) {
+
+          if (toolName !== originalToolName) {
             logger.debug(`[AcpBackend] Detected tool name: ${toolName} from toolCallId: ${toolCallId}`);
           }
           

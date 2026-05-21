@@ -382,6 +382,42 @@ export async function acquireDaemonLock(
 }
 
 /**
+ * Read the PID recorded inside the daemon lock file.
+ *
+ * The lock file's body is a single number written by {@link acquireDaemonLock}.
+ * Returns `null` if the file doesn't exist, is empty, contains non-numeric
+ * content, or can't be read for any reason — callers should treat any failure
+ * as "no recoverable PID" and fall back to their normal logic.
+ *
+ * Used by stopDaemon's orphan-recovery path: if `daemon.state.json` was
+ * deleted but the lock file still points at a live process, this lets us
+ * identify and kill it without relying on the missing state file.
+ */
+export function readDaemonLockPid(): number | null {
+  return parseDaemonLockPidFromPath(configuration.daemonLockFile);
+}
+
+/**
+ * Pure, dependency-free variant of {@link readDaemonLockPid} that takes an
+ * explicit lock-file path. Split out so unit tests can drive it against a
+ * temp directory without needing to override the `HAPPY_HOME_DIR` env var
+ * (which is consumed by the configuration singleton at module load and is
+ * therefore awkward to change after tests have already imported).
+ */
+export function parseDaemonLockPidFromPath(lockFilePath: string): number | null {
+  try {
+    if (!existsSync(lockFilePath)) return null;
+    const raw = readFileSync(lockFilePath, 'utf-8').trim();
+    if (!raw) return null;
+    const pid = Number(raw);
+    if (!Number.isFinite(pid) || pid <= 0 || !Number.isInteger(pid)) return null;
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Release daemon lock by closing handle and deleting lock file
  */
 export async function releaseDaemonLock(lockHandle: FileHandle): Promise<void> {
